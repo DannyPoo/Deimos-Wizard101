@@ -1,6 +1,9 @@
 import asyncio
 import struct
 import warnings
+import math
+import time
+from loguru import logger
 from functools import cached_property, partial
 from typing import Callable, List, Optional
 
@@ -31,6 +34,9 @@ from .memory import (
     TeleportHelper,
     MovementTeleportHook,
     DropsToggleHook,
+    AhmarraAutoPuzzleHook,
+    UpdateZoneCounterHook,
+    ServerMoveSnapbackHook,
 )
 from .memory.memory_objects.character_registry import DynamicCharacterRegistry
 from .memory.memory_objects.quest_client_manager import QuestClientManager
@@ -82,6 +88,10 @@ class Client:
         self._teleport_helper = TeleportHelper(self.hook_handler)
 
         self._disable_drops_bool = None
+        self._auto_puzzle_bool = None
+        self._teleport_distance = 0  # 0 = single-hop teleport (was 2000 stepped hops)
+        self._server_move_snapback_bool = None
+        self._server_teleport_snapback_bool = None
         self._template_ids = None
         self._world_view_window = None
         self._character_registry_addr = None
@@ -497,6 +507,9 @@ class Client:
         await body.write_yaw(yaw)
         await utils.timed_send_key(self.window_handle, Keycode.W, move_seconds)
 
+    async def modify_teleport_distance(self, value: int):
+        self._teleport_distance = value
+
     async def teleport(
             self,
             xyz: XYZ,
@@ -522,14 +535,105 @@ class Client:
         """
         client_object_addr = await self.client_object.read_base_address()
 
-        await self._teleport_object(
-            client_object_addr,
-            xyz,
-            wait_on_inuse,
-            wait_on_inuse_timeout,
-            purge_on_after_unuser_fixer,
-            purge_on_after_unuser_fixer_timeout,
-        )
+        player_is_mounted = False
+        pet_mode = False
+
+        if parent := await self.client_object.parent():
+            if await parent.object_name() == "Player Object":
+                pet_mode = True
+
+        if not pet_mode:
+            equipment_behavior = await self.client_object.try_get_equipment_behavior()
+            item_list = await equipment_behavior.item_list()
+
+            for item in item_list:
+                template = await item.object_template()
+                template = WizGameObjectTemplate(self.hook_handler, await template.read_base_address())
+
+                name = await template.object_name()
+                name = name.lower()
+
+                if (len(name) >= 3 and name[:3] == "mnt") or (len(name) >= 5 and name[:5] == "mount"):
+                    player_is_mounted = True
+                    break
+
+        current_xyz = await self.client_object.location() if pet_mode else await self.body.position()
+        distance_from_final = math.dist((xyz.x, xyz.y), (current_xyz.x, current_xyz.y))
+
+        teleport_distance = (1.4 * self._teleport_distance) if player_is_mounted else self._teleport_distance
+
+        if teleport_distance == 0 or distance_from_final <= teleport_distance:
+            await self._teleport_object(
+                client_object_addr,
+                xyz,
+                wait_on_inuse,
+                wait_on_inuse_timeout,
+                purge_on_after_unuser_fixer,
+                purge_on_after_unuser_fixer_timeout,
+            )
+
+            if yaw is not None:
+                await self.body.write_yaw(yaw)
+
+            return
+
+        angle = math.atan2(xyz.y - current_xyz.y, xyz.x - current_xyz.x)
+
+        await self.reset_server_move_snapback()
+
+        while distance_from_final > teleport_distance:
+            step_x = current_xyz.x + (teleport_distance * math.cos(angle))
+            step_y = current_xyz.y + (teleport_distance * math.sin(angle))
+
+            new_xyz = XYZ(step_x, step_y, -131068) # 32769
+            #print(new_xyz)
+
+            await self._teleport_object(
+                client_object_addr,
+                new_xyz,
+                wait_on_inuse,
+                wait_on_inuse_timeout,
+                purge_on_after_unuser_fixer,
+                purge_on_after_unuser_fixer_timeout,
+            )
+
+            try:
+                await maybe_wait_for_value_with_timeout(
+                    self.is_server_move_snapbacked,
+                    value=True,
+                    sleep_time=0.01,
+                    timeout=0.3,
+                )
+
+                await asyncio.sleep(0.2)
+            except ExceptionalTimeout:
+                pass
+
+            current_xyz = await self.client_object.location() if pet_mode else await self.body.position()
+
+            distance_from_final = math.dist((xyz.x, xyz.y), (current_xyz.x, current_xyz.y))
+
+        while True:
+            await self._teleport_object(
+                client_object_addr,
+                xyz,
+                wait_on_inuse,
+                wait_on_inuse_timeout,
+                purge_on_after_unuser_fixer,
+                purge_on_after_unuser_fixer_timeout,
+            )
+
+            try:
+                await maybe_wait_for_value_with_timeout(
+                    self.is_server_move_snapbacked,
+                    value=True,
+                    sleep_time=0.01,
+                    timeout=0.3,
+                )
+
+                await asyncio.sleep(0.2)
+            except ExceptionalTimeout:
+                break
 
         if yaw is not None:
             await self.body.write_yaw(yaw)
@@ -552,11 +656,13 @@ class Client:
 
             await maybe_wait_for_value_with_timeout(
                 self._teleport_helper.should_update,
+                sleep_time=0.01,
                 value=False,
                 timeout=wait_on_inuse_timeout,
             )
 
         jes = await self._get_je_instruction_forward_backwards()
+        _tp_t0 = time.perf_counter()
 
         await self._teleport_helper.write_target_object_address(object_address)
         await self._teleport_helper.write_position(xyz)
@@ -569,10 +675,13 @@ class Client:
             try:
                 await maybe_wait_for_value_with_timeout(
                     self._teleport_helper.should_update,
+                    sleep_time=0.01,
                     value=False,
                     timeout=purge_on_after_unuser_fixer_timeout,
                 )
+                logger.debug(f"TELEPORT TIMING: hook consumed in {time.perf_counter() - _tp_t0:.3f}s")
             except ExceptionalTimeout:
+                logger.warning(f"TELEPORT TIMING: hook did NOT consume within {purge_on_after_unuser_fixer_timeout}s (fallback used)")
                 movement_teleport_hook = self.hook_handler._get_hook_by_type(MovementTeleportHook)
                 for je, old_bytes in zip(jes, movement_teleport_hook._old_jes_bytes):
                     await self.hook_handler.write_bytes(je, old_bytes)
@@ -602,6 +711,74 @@ class Client:
             self._disable_drops_bool, 
             b"\x01"
         )
+
+    async def enable_auto_puzzle(self):
+        if not self.hook_handler._check_if_hook_active(AhmarraAutoPuzzleHook):
+            raise RuntimeError("Auto puzzle not active")
+
+        if not self._auto_puzzle_bool:
+            self._auto_puzzle_bool = await self.hook_handler.read_auto_puzzle_bool()
+
+        await self.hook_handler.write_bytes(
+            self._auto_puzzle_bool,
+            b"\x01"
+        )
+
+    async def disable_auto_puzzle(self):
+        if not self.hook_handler._check_if_hook_active(AhmarraAutoPuzzleHook):
+            raise RuntimeError("Auto puzzle not active")
+
+        if not self._auto_puzzle_bool:
+            self._auto_puzzle_bool = await self.hook_handler.read_auto_puzzle_bool()
+
+        await self.hook_handler.write_bytes(
+            self._auto_puzzle_bool,
+            b"\x00"
+        )
+    
+    async def is_server_teleport_snapbacked(self):
+        if not self.hook_handler._check_if_hook_active(UpdateZoneCounterHook):
+            raise RuntimeError("Update zone counter not active")
+        
+        if not self._server_teleport_snapback_bool:
+            self._server_teleport_snapback_bool = await self.hook_handler.read_server_teleport_snapback_bool()
+
+        return await self.hook_handler.read_typed(self._server_teleport_snapback_bool, Primitive.bool)
+    
+    async def reset_server_teleport_snapback(self):
+        if not self.hook_handler._check_if_hook_active(UpdateZoneCounterHook):
+            raise RuntimeError("Update zone counter not active")
+        
+        if not self._server_teleport_snapback_bool:
+            self._server_teleport_snapback_bool = await self.hook_handler.read_server_teleport_snapback_bool()
+        
+        await self.hook_handler.write_bytes(
+            self._server_teleport_snapback_bool,
+            b"\x00"
+        )
+
+    async def is_server_move_snapbacked(self) -> bool:
+        if not self.hook_handler._check_if_hook_active(ServerMoveSnapbackHook):
+            raise RuntimeError("Server move snapback not active")
+
+        if not self._server_move_snapback_bool:
+            self._server_move_snapback_bool = await self.hook_handler.read_server_move_snapback_bool()
+
+        value = await self.hook_handler.read_typed(self._server_move_snapback_bool, Primitive.bool)
+
+        if value:
+            await self.reset_server_move_snapback()
+
+        return value
+
+    async def reset_server_move_snapback(self):
+        if not self.hook_handler._check_if_hook_active(ServerMoveSnapbackHook):
+            raise RuntimeError("Server move snapback not active")
+
+        if not self._server_move_snapback_bool:
+            self._server_move_snapback_bool = await self.hook_handler.read_server_move_snapback_bool()
+
+        await self.hook_handler.write_typed(self._server_move_snapback_bool, False, Primitive.bool)
 
     async def _get_je_instruction_forward_backwards(self):
         """
@@ -736,7 +913,7 @@ class Client:
                 b"\x48\xBA" + packed_new_camera_address +  # mov rdx, new_cam_addr
                 b"\x49\xC7\xC0\x01\x00\x00\x00"  # mov r8, 0x1
                 b"\x48\x8B\x01"  # mov rax, [rcx]
-                b"\x48\x8B\x80\x78\x04\x00\x00"  # mov rax, [rax+0x478]
+                b"\x48\x8B\x80\x98\x04\x00\x00"  # mov rax, [rax+0x498]
                 b"\x49\x89\xC1"  # mov r9, rax
                 b"\xFF\xD0"  # call rax
 

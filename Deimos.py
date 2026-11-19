@@ -75,7 +75,7 @@ from src.world_to_screen import get_camera_state, project_point, world_to_screen
 
 cMessageBox = ctypes.windll.user32.MessageBoxW
 
-tool_version: str = "3.14.1"
+tool_version: str = "3.14.0"
 tool_name: str = "Deimos"
 tool_author: str = "Deimos-Wizard101"
 repo_name: str = tool_name + "-Wizard101"
@@ -4154,6 +4154,44 @@ async def main():
             except Exception:
                 pass
 
+    async def zone_check_loop():
+        zone_blacklist = ["Raids", "Battlegrounds"]
+
+        explicit_zone_blacklist = [
+            "WizardCity/WC_Duel_Arena_New",
+            "WizardCity/KT_Duel_Arena",
+            "WizardCity/MB_Arena",
+            "WizardCity/MS_Arena",
+            "WizardCity/DS_Arena",
+            "WizardCity/CL_Arena",
+            "WizardCity/ZF_Arena",
+            "WizardCity/AV_Arena",
+            "WizardCity/AZ_Arena",
+            "WizardCity/PA_Arena",
+            "WizardCity/GH_Arena",
+            "WizardCity/LM_Arena",
+        ]
+
+        async def async_zone_check(client: Client):
+            while True:
+                await asyncio.sleep(0.25)
+                zone_name = await client.zone_name()
+                if zone_name in explicit_zone_blacklist:
+                    logger.critical(
+                        f"Client {client.title} entered area with known anticheat, killing {tool_name}."
+                    )
+                    await kill_tool(False)
+                if zone_name and "/" in zone_name:
+                    split_zone_name = zone_name.split("/")
+
+                    if any([i in split_zone_name[0] for i in zone_blacklist]):
+                        logger.critical(
+                            f"Client {client.title} entered area with known anticheat, killing {tool_name}."
+                        )
+                        await kill_tool(False)
+
+        await asyncio.gather(*[async_zone_check(p) for p in walker.clients])
+
     await asyncio.sleep(0)
     global walker
     walker = ClientHandler()
@@ -4250,6 +4288,7 @@ async def main():
         "entity_detect_combat_loop",
         "potion_usage_loop",
         "drop_logging_loop",
+        "zone_check_loop",
         "anti_afk_questing_loop",
     ]
     SNAPSHOT_TASK_FUNCS = {
@@ -4258,6 +4297,7 @@ async def main():
         "entity_detect_combat_loop": entity_detect_combat_loop,
         "potion_usage_loop": potion_usage_loop,
         "drop_logging_loop": drop_logging_loop,
+        "zone_check_loop": zone_check_loop,
         "anti_afk_questing_loop": anti_afk_questing_loop,
     }
 
@@ -4341,6 +4381,7 @@ async def main():
         all_tasks["rpc_loop"] = asyncio.create_task(rpc_loop())
         all_tasks["drop_logging_loop"] = asyncio.create_task(drop_logging_loop())
         all_tasks["client_resizing_loop"] = asyncio.create_task(client_resizing_loop())
+        all_tasks["zone_check_loop"] = asyncio.create_task(zone_check_loop())
         all_tasks["anti_afk_questing_loop"] = asyncio.create_task(
             anti_afk_questing_loop()
         )
