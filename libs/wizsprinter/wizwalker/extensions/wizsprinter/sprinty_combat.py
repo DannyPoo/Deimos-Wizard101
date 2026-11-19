@@ -1578,7 +1578,45 @@ class SprintyCombat(CombatHandler):
         if target == False:  # Wouldn't want a None to mess it up
             _dbg(f"[MT-DBG] target is False for {move_config.target}")
             return False
+        # Special pseudo-cards are strings, not CombatCard objects.
+        # They must be handled before card-only filtering / multi-target checks.
+        if len(candidates) == 1 and candidates[0] == "willcast":
+            if willcasted:
+                return True
 
+            spell_checkbox_windows = await self.client.root_window.get_windows_with_type("SpellCheckBox")
+            pet_cards = [x for x in spell_checkbox_windows if await x.name() == "PetCard"]
+
+            if not pet_cards:
+                return False
+
+            wnd = pet_cards[0]
+
+            if await wnd.flags() - WindowFlags.disabled >= 0:
+                return True
+
+            card = CombatCard(self, wnd)
+            if await card.is_castable():
+                await card.cast(target)
+                await asyncio.sleep(self.config.cast_time * 2)
+                return (True, True)
+
+            return True
+
+        if len(candidates) == 1 and candidates[0] == "discard":
+            if type(target) is list:
+                for card in target:
+                    combat_card = await self.try_get_spell(card, castable=False)
+                    if combat_card is not None:
+                        await self.disc_on_target(combat_card)
+                        await asyncio.sleep(self.config.cast_time * 2)
+            else:
+                combat_card = await self.try_get_spell(target, castable=False)
+                if combat_card is not None:
+                    await self.disc_on_target(combat_card)
+                    await asyncio.sleep(self.config.cast_time * 2)
+
+            return True
         ttype = move_config.target.target_type if move_config.target else None
         req_t = target[0] if isinstance(target, list) else target
         req_member = req_t if isinstance(req_t, CombatMember) else None
