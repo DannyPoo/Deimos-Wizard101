@@ -1,3 +1,4 @@
+import time
 import asyncio
 from wizwalker import XYZ, Orient, Client, Keycode
 from wizwalker.file_readers.wad import Wad
@@ -390,6 +391,12 @@ _RETREAT_STEPS = (70.0, 140.0, 230.0, 350.0, 520.0)
 # is proof the game sent us back. Same constant, same 3D distance, same meaning.
 _TP_ORIGIN_SIGMA = 5.0
 
+# How far (horizontal units) from the requested spot still counts as "landed". Was 60; raised
+# because landings 100-330u off were being treated as bounces and triggering retreat + walking.
+_ARRIVE_TOL = 350.0
+_CONFIRM_AFTER = 0.3   # seconds near dest before we call a teleport landed
+_POLL_INTERVAL = 0.05
+
 
 def _sent_back(pos: XYZ, origin: XYZ) -> bool:
     """navmap_tp's landing test, verbatim: it is a rejected teleport iff we have not
@@ -398,7 +405,7 @@ def _sent_back(pos: XYZ, origin: XYZ) -> bool:
 
 
 async def _arrived(client: Client, dest: XYZ, origin: XYZ = None, zone_before: str = None,
-                   settle: float = 1.0, tol: float = 60.0) -> bool:
+                   settle: float = 1.0, tol: float = None) -> bool:
     """True if, after letting the server settle, the teleport to ``dest`` actually took.
 
     Two independent signals, because either one alone has a blind spot:
@@ -417,7 +424,30 @@ async def _arrived(client: Client, dest: XYZ, origin: XYZ = None, zone_before: s
     retreating would only fight whatever moved us. Unreadable position -> assume success
     rather than thrash on a transient read error.
     """
-    await asyncio.sleep(settle)
+    if tol is None:
+        tol = _ARRIVE_TOL
+    # Poll instead of one blind sleep: once we've sat near ``dest`` past the point where a
+    # server rubber-band would have shown up, call it landed and return right away. That
+    # makes the teleport finish quickly and means the player moving on manually afterwards
+    # can no longer be mistaken for a bounce (which used to trigger retreat teleports).
+    _t0 = time.monotonic()
+    while True:
+        _el = time.monotonic() - _t0
+        if _el >= settle:
+            break
+        await asyncio.sleep(min(_POLL_INTERVAL, settle - _el))
+        _el = time.monotonic() - _t0
+        if _el >= _CONFIRM_AFTER:
+            try:
+                _p = await client.body.position()
+                if math.hypot(_p.x - dest.x, _p.y - dest.y) <= tol:
+                    logger.debug(
+                        f"[collision_tp] {client.title}: landed at dest after {_el:.2f}s "
+                        f"(off={math.hypot(_p.x - dest.x, _p.y - dest.y):.0f}u) -> ok"
+                    )
+                    return True
+            except Exception:
+                return True
     try:
         if zone_before is not None and await client.zone_name() != zone_before:
             logger.debug(f"[collision_tp] {client.title}: zone changed during teleport; done")
@@ -436,7 +466,13 @@ async def _arrived(client: Client, dest: XYZ, origin: XYZ = None, zone_before: s
                 f"teleport to {dest} was rejected"
             )
             return False
-    return math.hypot(pos.x - dest.x, pos.y - dest.y) <= tol
+    _d = math.hypot(pos.x - dest.x, pos.y - dest.y)
+    logger.debug(
+        f"[collision_tp] {client.title}: arrival check: pos=({pos.x:.0f},{pos.y:.0f}) "
+        f"dest=({dest.x:.0f},{dest.y:.0f}) off={_d:.0f}u tol={tol:.0f} "
+        f"from_origin={calc_Distance(pos, origin) if origin is not None else -1:.0f}u -> {'ok' if _d <= tol else 'BOUNCED'}"
+    )
+    return _d <= tol
 
 
 async def _teleport_once_verified(client: Client, dest: XYZ, anchor: XYZ,
